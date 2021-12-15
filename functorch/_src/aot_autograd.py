@@ -101,6 +101,7 @@ class InvalidNodeBase(object):
         return "Invalid Node"
 InvalidNode = InvalidNodeBase()
 
+import networkx as nx
 def _extract_graph_with_inputs_outputs(joint_graph, inputs, outputs):
     """
     Given a graph, extracts out a subgraph that takes the specified nodes as inputs and returns the specified outputs.
@@ -153,17 +154,20 @@ def _extract_graph_with_inputs_outputs(joint_graph, inputs, outputs):
     new_graph.lint()
     return new_graph
 
+import math
+from torch.fx.passes import shape_prop
 def partition_with_recompute_fwd_in_bwd(joint_module: fx.GraphModule, _joint_inputs):
     """
     Partitions the joint graph such that the backward recomputes the forward.
-    Recopmuting helps in trading off memory bandwidth with computation.
+    Recomputing helps in trading off memory bandwidth with computation.
 
     To create the fwd and bwd graph, we copy the joint graph, manually set the
     outputs to just original forward or backward outputs. And then we run the
     resulting graphs through dead code elimintation.
     """
 
-
+    # draw_graph(joint_module, "joint.svg")
+    shape_prop.ShapeProp(joint_module).run(*pytree.tree_flatten(_joint_inputs)[0])
     def is_primal(node):
         return node.op == "placeholder" and "tangents" not in node.target
 
@@ -175,13 +179,70 @@ def partition_with_recompute_fwd_in_bwd(joint_module: fx.GraphModule, _joint_inp
     fwd_outputs = outputs[:num_fwd_outputs]
     bwd_outputs = outputs[num_fwd_outputs:]
 
-    saved_values = list(filter(is_primal, nodes))
+    primal_inputs = list(filter(is_primal, joint_module.graph.nodes))
+    tangent_inputs = list(filter(is_tangent, joint_module.graph.nodes))
+    full_bw_graph = joint_module.graph
 
-    random_ops = set([torch.ops.aten.rand_like])
-    random_nodes = list(filter(lambda x: x.target in random_ops, nodes))
+    nx_graph = nx.DiGraph()
+    tangent_closure = set()
+    name_to_node = {}
+    for node in full_bw_graph.nodes:
+        name_to_node[node.name] = node
+        if node.op == 'placeholder' and "tangents" in node.target:
+            tangent_closure.add(node)
+        if node in tangent_closure:
+            for user in node.users:
+                tangent_closure.add(user)
 
-    for node in random_nodes:
-        saved_values.append(node)
+    compute_intense_ops = [aten.bmm, aten.addmm, aten.cudnn_convolution_backward, aten.cudnn_convolution, aten.max_pool2d_with_indices]
+    view_ops = [aten.expand, aten.clone, aten.transpose, aten.t, aten.view, aten._unsafe_view, aten.permute, aten.transpose, aten.t, aten._reshape_alias, aten.squeeze]
+    misc_ops = [aten.cat, aten.stack, aten.select, aten.repeat, aten.unbind, aten.new_zeros, aten.cudnn_batch_norm]
+    random_ops = [aten.rand_like]
+    buggy_ops = [aten.native_layer_norm]
+    not_recomputable_ops = compute_intense_ops + view_ops + misc_ops + random_ops + buggy_ops
+
+    for node in full_bw_graph.nodes:
+        if node in tangent_closure:
+            nx_graph.add_edge(node.name+"_in", "sink", capacity=math.inf)
+            continue
+        if node.op == 'placeholder' and "primals" in node.target:
+            nx_graph.add_edge("source", node.name+"_in", capacity=math.inf)
+        
+        if not issubclass(node.meta['type'], torch.Tensor):
+            weight = math.inf
+        else:
+            mem_sz = node.meta['tensor_meta'].nbytes
+            if node.op == 'placeholder':
+                weight = mem_sz
+            else:
+                weight = mem_sz * 2
+
+        if node.target in not_recomputable_ops:
+            nx_graph.add_edge("source", node.name+"_in", capacity=math.inf)
+
+        nx_graph.add_edge(node.name+"_in", node.name+"_out", capacity=weight)
+        for user in node.users:
+            nx_graph.add_edge(node.name+"_out", user.name+"_in", capacity=math.inf)
+
+    cut_value, partition = nx.minimum_cut(nx_graph, "source", "sink")
+    print("cut_value", cut_value/1e9)
+    reachable, non_reachable = partition
+    cutset = set()
+    for u, nbrs in ((n, nx_graph[n]) for n in reachable):
+        cutset.update((u, v) for v in nbrs if v in non_reachable)
+
+    cut_nodes = set()
+    for node_in, node_out in cutset:
+        assert node_in[:-3] == node_out[:-4]
+        node_name = node_in[:-3]
+        cut_nodes.add(node_name)
+    # print(len(cut_nodes), sorted(list(cut_nodes)))
+
+
+    saved_values = [name_to_node[node] for node in cut_nodes]
+
+    # print(sorted([node.meta['tensor_meta'].nbytes for node in saved_values]))
+    # print(sorted(saved_values, key=lambda x: x.meta['tensor_meta'].nbytes))
 
     primal_inputs = list(filter(is_primal, joint_module.graph.nodes))
     tangent_inputs = list(filter(is_tangent, joint_module.graph.nodes))
@@ -241,6 +302,10 @@ def create_compiled_function(flat_fn, fw_compiler, bw_compiler, partition_fn, de
     def detach_decomposition(x):
         return x
 
+    @register_decomposition(aten._reshape_alias)
+    def _reshape_alias(x, shape, strides):
+        return aten.reshape(x, shape)
+
     joint_forward_backward = create_joint_forward_backward(flat_fn)
 
     compiled_fw = None
@@ -265,12 +330,26 @@ def create_compiled_function(flat_fn, fw_compiler, bw_compiler, partition_fn, de
                             fx_g = make_fx(joint_forward_backward)(*joint_inputs)
                     else:
                         fx_g = make_fx(joint_forward_backward)(*joint_inputs)
+                # for i in range(1000):
+                #     attr = f'_tensor_constant{i}'
+                #     if hasattr(fx_g, attr):
+                #         setattr(fx_g, attr, getattr(fx_g, attr).cuda())
+                #     else:
+                #         break
                 fw_module, bw_module = partition_fn(fx_g, joint_inputs)
                 # print(fw_module.code, bw_module.code)
 
                 compiled_fw = fw_compiler(fw_module, flat_args)
                 fw_outs = normalize_as_list(compiled_fw(*flat_args))
 
+
+                sz = []
+                for act in fw_outs[num_outs:]:
+                    if isinstance(act, torch.nn.parameter.Parameter):
+                        act = act.data
+                        continue
+                    sz.append(act.storage().nbytes())
+                print(f"Saved activation GB: {sum(sz)/1e9}")
                 bw_args = fw_outs[num_outs:] + fw_outs[0:num_outs]
                 compiled_bw = bw_compiler(bw_module, bw_args)
             fw_outs = normalize_as_list(compiled_fw(*flat_args))
@@ -282,7 +361,8 @@ def create_compiled_function(flat_fn, fw_compiler, bw_compiler, partition_fn, de
         @staticmethod
         def backward(ctx, *flat_args):
             # hmm... this doesn't feel right. todo
-            contiguous_args = [t.contiguous() for t in flat_args]
+            # contiguous_args = [t.contiguous() for t in flat_args]
+            contiguous_args = [t for t in flat_args]
             out = normalize_as_list(compiled_bw(*ctx.saved_tensors, *contiguous_args))
             out_iter = iter(out)
             grad_out = [next(out_iter) if p else None for p in ctx.needs_input_grad]

@@ -56,7 +56,7 @@ def hardshrink_backward(grad_out: Tensor, self: Tensor, lambd: float):
 
 @register_decomposition(aten.threshold_backward)
 def threshold_backward_decomposition(grad_output: Tensor, self: Tensor, threshold: float):
-    return aten.where(self <= threshold, aten.new_zeros(grad_output, ()), grad_output)
+    return aten.where(self <= threshold, aten.new_zeros(grad_output, (1,)), grad_output)
 
 @register_decomposition(aten.leaky_relu_backward)
 def leaky_relu_backward_decomposition(grad_output: Tensor, self: Tensor, negative_slope: float, self_is_result: bool):
@@ -115,6 +115,11 @@ def select_backward(grad_output: Tensor, input_sizes: List[int], dim: int, index
 def diagonal_backward(grad_output: Tensor, input_sizes: List[int], offset: int, dim1: int, dim2: int):
     grad_input = aten.new_zeros(grad_output, input_sizes)
     return aten.diagonal_scatter(grad_input, grad_output, offset, dim1, dim2)
+
+# @register_decomposition(aten._softmax)
+# def _softmax(x: Tensor, dim: int, half_to_float: bool):
+#     return aten.exp(x) / aten.sum(aten.exp(x), dim=dim, keepdim=True)
+
 
 @register_decomposition(aten._softmax_backward_data)
 def _softmax_backward_data(grad_output: Tensor, output: Tensor, dim: int, input_dtype: int):

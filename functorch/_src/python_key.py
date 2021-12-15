@@ -20,6 +20,7 @@ from enum import Enum
 import warnings
 from contextlib import contextmanager
 
+aten = torch.ops.aten
 
 USE_DECOMPOSE = False
 
@@ -67,6 +68,9 @@ class PythonTensor(torch.Tensor):
         proxy_args = pytree.tree_map(unwrap_proxy, args)
         proxy_kwargs = pytree.tree_map(unwrap_proxy, kwargs)
         proxy_out = func(*proxy_args, **proxy_kwargs)
+
+        if func in {aten.add_, aten.relu_}:
+            args[0].proxy = proxy_out
         real_out = func(*pytree.tree_map(unwrap_tensor, args), **pytree.tree_map(unwrap_tensor, kwargs))
 
         def wrap_with_proxy(e, idx):
